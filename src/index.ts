@@ -42,12 +42,30 @@ interface DbConfig {
   password: string;
 }
 
+interface SourceDbConfig {
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+}
+
+interface ColumnDefault {
+  TABLE_SCHEMA: string;
+  TABLE_NAME: string;
+  COLUMN_NAME: string;
+  DATA_TYPE: string;
+  IS_NULLABLE: "YES" | "NO";
+  COLUMN_DEFAULT: string | null;
+  EXTRA: string;
+}
+
 type Action =
   | "scan"
   | "report"
   | "fix_nulls"
   | "allow_nulls"
   | "convert_timestamps"
+  | "sync_defaults"
   | "exit";
 
 const CACHE_FILE = ".db-fixer-cache.json";
@@ -79,7 +97,19 @@ function getConfig(): DbConfig {
   return config;
 }
 
-function createKnex(config: DbConfig): KnexType {
+function getSourceConfig(): SourceDbConfig | null {
+  const host = process.env.SOURCE_DB_HOST;
+  if (!host) return null;
+
+  return {
+    host,
+    port: Number(process.env.SOURCE_DB_PORT) || 3306,
+    user: process.env.SOURCE_DB_USER || process.env.DB_USER || "root",
+    password: process.env.SOURCE_DB_PASSWORD || process.env.DB_PASSWORD || "",
+  };
+}
+
+function createKnex(config: DbConfig | SourceDbConfig): KnexType {
   return Knex({
     client: "mysql2",
     connection: {
@@ -232,12 +262,33 @@ async function convertTimestampToDatetime(
   table: string,
   column: string,
   isNullable: "YES" | "NO",
+  columnDefault: string | null,
   knex: KnexType,
 ): Promise<void> {
   const nullableClause = isNullable === "YES" ? "NULL" : "NOT NULL";
 
+  // Build default clause - preserve existing default if present
+  let defaultClause = "";
+  if (columnDefault !== null) {
+    // Handle common defaults
+    if (
+      columnDefault === "CURRENT_TIMESTAMP" ||
+      columnDefault === "current_timestamp()"
+    ) {
+      defaultClause = " DEFAULT CURRENT_TIMESTAMP";
+    } else if (columnDefault.toUpperCase().startsWith("CURRENT_TIMESTAMP")) {
+      // Handle CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP etc.
+      defaultClause = ` DEFAULT ${columnDefault}`;
+    } else {
+      defaultClause = ` DEFAULT '${columnDefault}'`;
+    }
+  } else if (isNullable === "NO") {
+    // If NOT NULL and no default, set a sensible default
+    defaultClause = " DEFAULT CURRENT_TIMESTAMP";
+  }
+
   await knex.raw(
-    `ALTER TABLE \`${schema}\`.\`${table}\` MODIFY COLUMN \`${column}\` DATETIME ${nullableClause}`,
+    `ALTER TABLE \`${schema}\`.\`${table}\` MODIFY COLUMN \`${column}\` DATETIME ${nullableClause}${defaultClause}`,
   );
 }
 
@@ -250,6 +301,63 @@ async function allowNullOnColumn(
 ): Promise<void> {
   await knex.raw(
     `ALTER TABLE \`${schema}\`.\`${table}\` MODIFY COLUMN \`${column}\` ${dataType.toUpperCase()} NULL`,
+  );
+}
+
+async function getColumnDefaults(
+  knex: KnexType,
+  schemas: string[],
+): Promise<ColumnDefault[]> {
+  const columns = await knex("information_schema.COLUMNS")
+    .select(
+      "TABLE_SCHEMA",
+      "TABLE_NAME",
+      "COLUMN_NAME",
+      "DATA_TYPE",
+      "IS_NULLABLE",
+      "COLUMN_DEFAULT",
+      "EXTRA",
+    )
+    .whereIn("TABLE_SCHEMA", schemas)
+    .whereIn("DATA_TYPE", ["timestamp", "datetime"]);
+
+  return columns;
+}
+
+async function applyColumnDefault(
+  knex: KnexType,
+  col: ColumnDefault,
+): Promise<void> {
+  const nullableClause = col.IS_NULLABLE === "YES" ? "NULL" : "NOT NULL";
+
+  // Build default clause
+  let defaultClause = "";
+  if (col.COLUMN_DEFAULT !== null) {
+    const defaultVal = col.COLUMN_DEFAULT;
+    if (
+      defaultVal === "CURRENT_TIMESTAMP" ||
+      defaultVal === "current_timestamp()" ||
+      defaultVal.toUpperCase().startsWith("CURRENT_TIMESTAMP")
+    ) {
+      defaultClause = ` DEFAULT ${defaultVal}`;
+    } else {
+      defaultClause = ` DEFAULT '${defaultVal}'`;
+    }
+  }
+
+  // Handle ON UPDATE in EXTRA
+  let extraClause = "";
+  if (
+    col.EXTRA &&
+    col.EXTRA.toLowerCase().includes("on update current_timestamp")
+  ) {
+    extraClause = " ON UPDATE CURRENT_TIMESTAMP";
+  }
+
+  const dataType = col.DATA_TYPE.toUpperCase();
+
+  await knex.raw(
+    `ALTER TABLE \`${col.TABLE_SCHEMA}\`.\`${col.TABLE_NAME}\` MODIFY COLUMN \`${col.COLUMN_NAME}\` ${dataType} ${nullableClause}${defaultClause}${extraClause}`,
   );
 }
 
@@ -635,6 +743,11 @@ async function selectAction(columns: ColumnInfo[]): Promise<Action> {
       disabled:
         timestampCount === 0 ? (hasCache ? "none found" : "scan first") : false,
     },
+    {
+      name: "📥 Sync defaults from source DB",
+      value: "sync_defaults",
+      disabled: !getSourceConfig() ? "set SOURCE_DB_HOST" : false,
+    },
     { name: "🚪 Exit", value: "exit" },
   ];
 
@@ -898,6 +1011,7 @@ async function executeTimestampConversions(
         col.TABLE_NAME,
         col.COLUMN_NAME,
         col.IS_NULLABLE,
+        col.COLUMN_DEFAULT,
         knex,
       );
       converted.push(col);
@@ -917,6 +1031,167 @@ async function executeTimestampConversions(
     );
     console.error(error);
     return converted; // Return what was successfully converted
+  }
+}
+
+// ============== Sync Defaults ==============
+async function executeSyncDefaults(
+  targetKnex: KnexType,
+  schemas: string[],
+): Promise<number> {
+  const sourceConfig = getSourceConfig();
+  if (!sourceConfig) {
+    console.log(chalk.red("\nSOURCE_DB_HOST not configured in .env\n"));
+    return 0;
+  }
+
+  console.log(
+    chalk.cyan(
+      `\nConnecting to source: ${sourceConfig.host}:${sourceConfig.port}`,
+    ),
+  );
+  const sourceKnex = createKnex(sourceConfig);
+
+  const spinner = ora("Fetching column defaults from source...").start();
+
+  try {
+    // Get defaults from source
+    const sourceDefaults = await getColumnDefaults(sourceKnex, schemas);
+    spinner.text = `Found ${sourceDefaults.length} date columns in source.`;
+
+    // Get current state from target
+    const targetDefaults = await getColumnDefaults(targetKnex, schemas);
+    spinner.succeed(
+      `Source: ${sourceDefaults.length} columns, Target: ${targetDefaults.length} columns`,
+    );
+
+    // Build lookup for target columns
+    const targetMap = new Map<string, ColumnDefault>();
+    for (const col of targetDefaults) {
+      const key = `${col.TABLE_SCHEMA}.${col.TABLE_NAME}.${col.COLUMN_NAME}`;
+      targetMap.set(key, col);
+    }
+
+    // Find differences
+    const differences: {
+      source: ColumnDefault;
+      target: ColumnDefault | undefined;
+    }[] = [];
+    for (const srcCol of sourceDefaults) {
+      const key = `${srcCol.TABLE_SCHEMA}.${srcCol.TABLE_NAME}.${srcCol.COLUMN_NAME}`;
+      const tgtCol = targetMap.get(key);
+
+      if (!tgtCol) {
+        // Column doesn't exist in target - skip
+        continue;
+      }
+
+      // Check if defaults differ
+      const srcDefault = srcCol.COLUMN_DEFAULT ?? "(none)";
+      const tgtDefault = tgtCol.COLUMN_DEFAULT ?? "(none)";
+      const srcExtra = srcCol.EXTRA || "";
+      const tgtExtra = tgtCol.EXTRA || "";
+
+      if (srcDefault !== tgtDefault || srcExtra !== tgtExtra) {
+        differences.push({ source: srcCol, target: tgtCol });
+      }
+    }
+
+    if (differences.length === 0) {
+      console.log(chalk.green("\n✓ All column defaults already match!\n"));
+      await sourceKnex.destroy();
+      return 0;
+    }
+
+    // Display differences
+    console.log(
+      chalk.yellow(
+        `\nFound ${differences.length} column(s) with different defaults:\n`,
+      ),
+    );
+    console.log(chalk.bold("─".repeat(120)));
+    console.log(
+      chalk.bold(
+        "  Column".padEnd(50) +
+          "Source Default".padEnd(35) +
+          "Target Default".padEnd(35),
+      ),
+    );
+    console.log(chalk.bold("─".repeat(120)));
+
+    for (const { source, target } of differences) {
+      const name =
+        `${source.TABLE_SCHEMA}.${source.TABLE_NAME}.${source.COLUMN_NAME}`.padEnd(
+          50,
+        );
+      const srcDef = (source.COLUMN_DEFAULT ?? "NULL").padEnd(35);
+      const tgtDef = (target?.COLUMN_DEFAULT ?? "NULL").padEnd(35);
+
+      console.log(`  ${name}${chalk.green(srcDef)}${chalk.red(tgtDef)}`);
+
+      // Show EXTRA differences if any
+      if (source.EXTRA !== target?.EXTRA) {
+        console.log(
+          chalk.gray(
+            `    EXTRA: ${chalk.green(source.EXTRA || "(none)")} → ${chalk.red(target?.EXTRA || "(none)")}`.padStart(
+              50,
+            ),
+          ),
+        );
+      }
+    }
+    console.log();
+
+    const confirmed = await confirm({
+      message: `Apply ${differences.length} default changes from source to target?`,
+      default: false,
+    });
+
+    if (!confirmed) {
+      console.log(chalk.yellow("Aborted."));
+      await sourceKnex.destroy();
+      return 0;
+    }
+
+    // Apply changes
+    const applySpinner = ora("Applying defaults...").start();
+    let applied = 0;
+    let failed = 0;
+
+    for (const { source } of differences) {
+      applySpinner.text = `[${applied + failed + 1}/${differences.length}] ${source.TABLE_SCHEMA}.${source.TABLE_NAME}.${source.COLUMN_NAME}...`;
+      try {
+        await applyColumnDefault(targetKnex, source);
+        applied++;
+      } catch (error) {
+        failed++;
+        applySpinner.stop();
+        console.log(
+          chalk.red(
+            `   ✗ Failed: ${source.TABLE_SCHEMA}.${source.TABLE_NAME}.${source.COLUMN_NAME}: ${error instanceof Error ? error.message : error}`,
+          ),
+        );
+        applySpinner.start();
+      }
+    }
+
+    if (failed === 0) {
+      applySpinner.succeed(
+        chalk.green(`Applied ${applied} default changes successfully!`),
+      );
+    } else {
+      applySpinner.warn(
+        chalk.yellow(`Applied ${applied} changes, ${failed} failed.`),
+      );
+    }
+
+    await sourceKnex.destroy();
+    return applied;
+  } catch (error) {
+    spinner.fail("Failed to sync defaults.");
+    console.error(error);
+    await sourceKnex.destroy();
+    return 0;
   }
 }
 
@@ -1090,6 +1365,17 @@ async function main(): Promise<void> {
           columns = await rescanColumns(knex, columns, affected);
           saveCache(config, selectedSchemas, columns);
         }
+        break;
+      }
+
+      case "sync_defaults": {
+        if (selectedSchemas.length === 0) {
+          console.log(
+            chalk.yellow("\nNo schemas selected. Please scan first.\n"),
+          );
+          break;
+        }
+        await executeSyncDefaults(knex, selectedSchemas);
         break;
       }
 
